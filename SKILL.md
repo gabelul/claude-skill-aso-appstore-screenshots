@@ -1,6 +1,6 @@
 ---
 name: aso-appstore-screenshots
-description: Generate high-converting App Store screenshots by analyzing your app's codebase, discovering core benefits, and creating ASO-optimized screenshot images using Nano Banana Pro.
+description: Generate high-converting App Store screenshots by analyzing your app's codebase, discovering core benefits, and creating ASO-optimized screenshot images with pixeltamer or a Gemini MCP.
 user-invocable: true
 ---
 
@@ -210,24 +210,42 @@ This is critical for resumability. If the user comes back in a new conversation,
 
 ## GENERATION
 
-Once benefits and screenshot pairings are confirmed, generate the final App Store screenshots using Nano Banana Pro (via the Gemini MCP server).
+Once benefits and screenshot pairings are confirmed, generate the final App Store screenshots with whichever image backend is available (see Prerequisites Check).
 
-### Prerequisites Check
+### Prerequisites Check — pick the image backend
 
-Before generating, verify the Gemini MCP server is available by checking that the `generate_image` tool exists. If it is NOT available, tell the user:
+The enhance stage needs an image model. Two are supported; **prefer pixeltamer**, fall back to a
+Gemini MCP. Detect in this order and remember the choice for the whole session:
 
-```
-⚠️ Gemini MCP server not detected. To generate screenshots, you need to set it up:
+**1. pixeltamer (preferred).** Run:
 
-1. Install: npm install -g gemini-mcp
-2. Add to your Claude Code MCP config (~/.claude/settings.json or project .mcp.json)
-3. Restart Claude Code
-4. Run this skill again
-
-See: https://github.com/nicobailon/gemini-mcp for setup instructions.
+```bash
+bash "$HOME/.claude/skills/pixeltamer/scripts/pixeltamer" doctor
 ```
 
-Do NOT proceed with generation if the tool is unavailable.
+If any backend row shows `✓`, use pixeltamer. (Invoke it via `bash …/pixeltamer` throughout — the
+dispatcher's execute bit does not survive every skill update, and the `bash` prefix works either way.)
+
+**2. Gemini MCP.** If pixeltamer is unavailable, check whether the `generate_image` / `edit_image`
+tools exist. If they do, use that path.
+
+**3. Neither.** Stop and tell the user:
+
+```
+⚠️ No image backend available. The enhance stage needs one of:
+
+  pixeltamer (preferred) — https://github.com/gabelul/pixeltamer
+    Uses gpt-image-2 via an OpenAI key OR the codex CLI on your ChatGPT subscription.
+    Check with: pixeltamer doctor
+
+  Gemini MCP — exposes generate_image / edit_image for Nano Banana Pro.
+    Add it to ~/.claude/settings.json or project .mcp.json, then restart Claude Code.
+
+Scaffolds (Stage 1) still work without either — you'd just get flat layouts, no photoreal device.
+```
+
+Do NOT proceed to the enhance stage without a backend. Scaffolding alone is a valid fallback if
+the user wants it — say so rather than stalling.
 
 ### App Store Connect Dimensions
 
@@ -241,7 +259,7 @@ App Store Connect is **very strict** about image dimensions — it will reject s
 
 Default to **1290 x 2796px** (iPhone 6.7") unless the user specifies otherwise. Ask the user which size(s) they need. Up to 10 screenshots can be uploaded per display size.
 
-**IMPORTANT — Aspect ratio mismatch**: Apple's required dimensions are narrower than standard 9:16 (~0.461 ratio vs 0.5625). Nano Banana generates at preset aspect ratios, so we generate **wider than needed** at 9:16 with 4K resolution, then **crop and resize** down to exact Apple dimensions in a post-processing step (see Step 4 below). This approach avoids stretching — we remove excess width instead.
+**IMPORTANT — Aspect ratio mismatch**: Apple's required dimensions are narrower than standard 9:16 (~0.461 ratio vs 0.5625), and image backends emit their own preset ratios. `finalize.py` (Step 3) reconciles this for both backends: it centre-crops anything too wide, then resizes to exact Apple dimensions. Sides get trimmed rather than the image stretched — which is why the horizontal safe area below is non-negotiable.
 
 ### Screenshot Format Specification
 
@@ -278,7 +296,13 @@ Breakout elements can give screenshots personality and make them feel dynamic. B
 
 Generation uses a two-stage approach for consistency:
 1. **Stage 1 (Scaffold)**: compose.py creates a deterministic local image with the correct text, device frame, and screenshot. This guarantees consistent layout across all screenshots.
-2. **Stage 2 (Enhance)**: The scaffold is sent to Nano Banana Pro to add breakout elements, depth, and visual polish.
+2. **Stage 2 (Enhance)**: The scaffold goes to the image backend to add a photoreal device, breakout elements, depth, and polish.
+3. **Stage 3 (Finalize)**: `finalize.py` crops to Apple's aspect, resizes to exact dimensions, and **repaints the headline**.
+
+**Why Stage 3 repaints the text**: image models re-render text rather than preserving it. Round-tripping a
+headline through one costs the exact letterforms and adds upscaling ringing — on the biggest, most
+conversion-critical element of the screenshot. The model does the artwork; Pillow owns the type. This also
+makes typography pixel-identical across the whole set for free.
 
 **The first approved screenshot becomes the style template for the entire set.** All subsequent screenshots are enhanced using both their own scaffold (for layout) AND the first approved screenshot (for style). This ensures every screenshot in the set has the same device frame rendering, text treatment, background style, and overall visual quality — so when viewed side-by-side in the App Store, they look like a cohesive professional set.
 
@@ -317,19 +341,80 @@ This outputs pixel-perfect 1290×2796 PNGs with:
 - Simulator screenshot composited inside the frame
 - Solid background colour
 
-The scaffolds are internal intermediates — do NOT show them to the user or ask for confirmation. Proceed immediately to Step 2 (Nano Banana enhancement).
+The scaffolds are internal intermediates — do NOT show them to the user or ask for confirmation. Proceed immediately to Step 2 (enhancement).
 
-**Step 2: Enhance with Nano Banana Pro (3 versions in parallel)**
+**Step 2: Enhance (3 versions in parallel)**
 
-Make **3 parallel `edit_image` calls**. The parallel execution is critical — always fire all 3 calls in a single message, never sequentially.
+Generate 3 versions so the user can pick. The prompt templates further down are backend-neutral —
+only the invocation differs.
 
-For each of the 3 calls, use:
-- `prompt`: Enhancement instructions (see prompt templates below — different for first vs subsequent screenshots)
-- `images`: See below for which images to include
-- `outputPath`: Different path for each version:
-  - `./screenshots/01-[benefit-slug]/v1.jpg`
-  - `./screenshots/01-[benefit-slug]/v2.jpg`
-  - `./screenshots/01-[benefit-slug]/v3.jpg`
+Reference image order matters on both backends: **scaffold first**, then style template, then
+approved design. The prompts refer to them as FIRST / SECOND / THIRD.
+
+---
+
+#### If the backend is pixeltamer
+
+One Bash call, three background jobs, one `wait`. That gives real parallelism *and* a single
+permission prompt.
+
+⚠️ **Set the Bash tool's `timeout` to `600000`** (or use `run_in_background`). A 4K-ish edit takes
+roughly 30s per image on the codex backend but is highly variable — the default 120s timeout will
+kill the batch mid-generation.
+
+```bash
+PT="$HOME/.claude/skills/pixeltamer/scripts/pixeltamer"
+DIR="screenshots/01-[benefit-slug]"
+PROMPT="$(cat <<'PROMPT_EOF'
+[PASTE THE FULL ENHANCEMENT PROMPT HERE — see templates below]
+PROMPT_EOF
+)"
+
+for V in 1 2 3; do
+  bash "$PT" edit -i "$DIR/scaffold.png" -o "$DIR/v$V.png" -p "$PROMPT" &
+done
+wait
+
+# `wait` hides failures — confirm all three actually landed.
+for V in 1 2 3; do
+  if [ ! -s "$DIR/v$V.png" ]; then echo "MISSING: v$V.png — regenerate this one"; fi
+done
+ls -la "$DIR"/v*.png
+```
+
+**One reference vs several — the subcommand changes.** `edit` accepts **exactly one** `-i` (its
+`--help` text claims the flag is repeatable; it is not — passing two exits with
+`edit requires exactly one -i/--image`). For two or three references use `compose`, which takes the
+same flags and the same repeated `-i`:
+
+```bash
+  # subsequent screenshots: scaffold + style template
+  bash "$PT" compose -i "$DIR/scaffold.png" -i "screenshots/final/01-[first-slug].jpg" \
+       -o "$DIR/v$V.png" -p "$PROMPT" &
+```
+
+So: **first screenshot → `edit`** (scaffold only), **every screenshot after it → `compose`**.
+Reference order is the argument order.
+
+If any version is reported MISSING, re-run just that one. Don't show the user a partial set.
+
+**Timing**: roughly 30s per single-reference `edit`, ~55s for a two-reference `compose`, running
+three at a time. Highly variable — hence the 600s timeout.
+
+**Note on output size**: pixeltamer's `--size` flag is not honoured on the codex backend for edits — it
+returns roughly the scaffold's aspect at ~850px wide regardless. That's expected. `finalize.py` upscales
+to Apple's dimensions, and because it repaints the headline afterwards, the upscale never touches the text.
+
+---
+
+#### If the backend is a Gemini MCP
+
+Make **3 parallel `edit_image` calls** in a single message — never sequentially.
+
+For each call:
+- `prompt`: the enhancement instructions below
+- `images`: the references described below
+- `outputPath`: `./screenshots/01-[benefit-slug]/v1.png`, `v2.png`, `v3.png`
 
 #### First screenshot (no approved template yet)
 
@@ -390,46 +475,57 @@ The result must look like it was designed alongside the style template as part o
 No watermarks, no extra text, no app store UI chrome.
 ```
 
-**IMPORTANT — Consistency enforcement**: The scaffold guarantees consistent layout. The style template guarantees consistent visual treatment. If Nano Banana changes the text, layout, or deviates from the style template, regenerate.
+**IMPORTANT — Consistency enforcement**: The scaffold guarantees consistent layout, the style template guarantees consistent visual treatment, and `finalize.py` guarantees consistent typography. If the backend changes the layout or deviates from the style template, regenerate. (Text drift you can ignore — Step 3 overwrites it.)
 
-**Step 3: IMMEDIATELY crop and resize ALL 3 versions to App Store dimensions**
+**Step 3: IMMEDIATELY finalize ALL 3 versions**
 
-⚠️ **You MUST run this immediately after all 3 `edit_image` calls complete. Do NOT show the user any image before running this. The raw Nano Banana output is always the wrong dimensions for App Store Connect.**
+⚠️ **Run this immediately after the enhance calls complete. Do NOT show the user any raw enhanced
+image.** Raw backend output is the wrong dimensions for App Store Connect, and its headline text is
+the model's re-rendering rather than the crisp original.
 
-**CRITICAL — Use exactly ONE Bash tool call for all 3 crop/resize operations.** Do NOT make 3 separate Bash calls. Do NOT use parallel Bash calls. Use the single loop below so the user only sees one permission prompt:
+`finalize.py` does all three jobs in one pass: centre-crop to Apple's aspect ratio, resize to exact
+pixel dimensions, and repaint the headline from the same code that drew the scaffold. Same command
+for both backends.
+
+**Use exactly ONE Bash tool call** so the user sees one permission prompt:
 
 ```bash
-TARGET_W=1290 && TARGET_H=2796 && \
-for INPUT in screenshots/01-[benefit-slug]/v1.jpg screenshots/01-[benefit-slug]/v2.jpg screenshots/01-[benefit-slug]/v3.jpg; do
-  OUTPUT="${INPUT%.jpg}-resized.jpg"
-  cp "$INPUT" "$OUTPUT"
-  W=$(sips -g pixelWidth "$OUTPUT" | tail -1 | awk '{print $2}')
-  H=$(sips -g pixelHeight "$OUTPUT" | tail -1 | awk '{print $2}')
-  CROP_W=$(python3 -c "print(round($H * $TARGET_W / $TARGET_H))")
-  OFFSET_X=$(python3 -c "print(round(($W - $CROP_W) / 2))")
-  sips --cropOffset 0 $OFFSET_X --cropToHeightWidth $H $CROP_W "$OUTPUT"
-  sips -z $TARGET_H $TARGET_W "$OUTPUT"
-  echo "--- $OUTPUT ---"
-  sips -g pixelWidth -g pixelHeight "$OUTPUT"
+SKILL_DIR="$HOME/.claude/skills/aso-appstore-screenshots"
+DIR="screenshots/01-[benefit-slug]"
+
+for V in 1 2 3; do
+  [ -s "$DIR/v$V.png" ] || continue
+  python3 "$SKILL_DIR/finalize.py" \
+    --input "$DIR/v$V.png" \
+    --bg "[HEX CODE]" --verb "[VERB]" --desc "[DESC]" \
+    --output "$DIR/v$V-resized.jpg" \
+    --width 1290 --height 2796
 done
 ```
 
-The script crops to the correct aspect ratio (top-center aligned — sides trimmed equally, top edge preserved so the headline stays put) and resizes to exact pixel dimensions. The resized image is saved as a separate file with `-resized.jpg` appended.
+`--verb` and `--desc` must be **byte-identical** to what you passed `compose.py` — that is what keeps
+the headline pixel-identical to the scaffold.
 
-Target dimensions per display size — adjust `TARGET_W` and `TARGET_H`:
-- iPhone 6.5": `TARGET_W=1242 TARGET_H=2688`
-- iPhone 6.7" (default): `TARGET_W=1290 TARGET_H=2796`
-- iPhone 6.9": `TARGET_W=1320 TARGET_H=2868`
+Output is JPEG deliberately: App Store Connect rejects PNGs carrying an alpha channel, and image
+backends often return RGBA.
+
+Target dimensions per display size — adjust `--width` and `--height`:
+- iPhone 6.5": `--width 1242 --height 2688`
+- iPhone 6.7" (default): `--width 1290 --height 2796`
+- iPhone 6.9": `--width 1320 --height 2868`
+
+Typography is always composed on the 1290×2796 design canvas and downscaled last, so headlines stay
+proportionally identical across all three sizes.
 
 **Step 4: Review all 3 versions with the user**
 
-Present all 3 **resized** versions (the `-resized.jpg` files) to the user using the Read tool. Never show the raw Nano Banana output — always show the post-processed versions.
+Present all 3 **resized** versions (the `-resized.jpg` files) to the user using the Read tool. Never show the raw backend output — always show the finalized versions.
 
 Label them clearly as **Version 1**, **Version 2**, and **Version 3** and ask the user to pick their favourite or request changes.
 
 **Step 5: Iterate if needed**
 
-If the user wants changes, use `edit_image` with **three images** as input:
+If the user wants changes, re-run the enhance with **three reference images** (pixeltamer: `compose`, repeating `-i` in this order; Gemini: pass all three in `images`):
 1. The **scaffold** (`scaffold.png`) — anchors the layout (text position, device placement, screenshot)
 2. The **style template** (the first approved screenshot from `screenshots/final/01-*.jpg`) — defines the device frame rendering and overall visual style that must be consistent across the entire set
 3. The **approved design** (the version the user liked best for this specific screenshot) — anchors the creative direction and breakout element approach
@@ -448,7 +544,7 @@ Generate a new version that keeps the layout from the scaffold, the device frame
 
 This prevents drift (scaffold keeps layout locked), maintains set-wide consistency (style template keeps device frame and visual treatment identical), and preserves the creative direction the user already approved.
 
-When iterating, generate **3 versions in parallel** again (3 parallel `edit_image` calls in a single message). Then **immediately run the Step 3 crop/resize loop on all 3 in a single Bash call** before showing the user.
+When iterating, generate **3 versions in parallel** again using the same Step 2 invocation for your backend. Then **immediately run the Step 3 `finalize.py` loop on all 3 in a single Bash call** before showing the user.
 
 Repeat until the user is happy.
 
@@ -489,15 +585,15 @@ Save generated screenshots to a `screenshots/` directory in the project root, or
 screenshots/
   01-track-card-prices/       ← working versions for benefit 1
     scaffold.png              ← deterministic compose.py output (text + frame + screenshot)
-    v1.jpg                    ← Nano Banana enhanced version 1
-    v1-resized.jpg            ← cropped/resized to App Store dimensions
-    v2.jpg
+    v1.png                    ← enhanced version 1 (raw backend output)
+    v1-resized.jpg            ← finalize.py: cropped, resized, headline repainted
+    v2.png
     v2-resized.jpg
-    v3.jpg
+    v3.png
     v3-resized.jpg
   02-search-any-card/         ← working versions for benefit 2
     scaffold.png
-    v1.jpg
+    v1.png
     ...
   final/                      ← approved screenshots, ready to upload
     01-track-card-prices.jpg

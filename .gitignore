@@ -3,3 +3,6 @@
 screenshots/
 __pycache__/
 *.pyc
+
+# macOS AppleDouble sidecars (this checkout may live on a non-APFS volume)
+._*

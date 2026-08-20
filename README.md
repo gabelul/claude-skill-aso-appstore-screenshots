@@ -93,3 +93,49 @@ The `final/` folder contains App Store-ready screenshots at exact Apple dimensio
 ## License
 
 MIT
+
+---
+
+## Local fork notes
+
+This copy diverges from upstream. Re-pulling the repo will clobber these — merge, don't overwrite.
+
+**1. Font fallback (`fonts.py`)** — upstream hardcodes `/Library/Fonts/SF-Pro-Display-{Black,Regular}.otf`,
+which only exist if you've downloaded Apple's font pack. On a stock Mac every run died with
+`OSError: cannot open resource`. `fonts.py` tries those first and falls back to the system variable font
+at `/System/Library/Fonts/SFNS.ttf`, pinned to the requested named weight. Install Apple's pack and it
+silently goes back to using it.
+
+**2. Backend-agnostic enhance stage** — the generation phase used to require a Gemini MCP. It now prefers
+[pixeltamer](https://github.com/gabelul/pixeltamer) (gpt-image-2 via OpenAI key or the codex CLI) and falls
+back to a Gemini MCP. See "Prerequisites Check" in `SKILL.md`.
+
+**3. `finalize.py` replaces the `sips` crop loop** — it centre-crops to Apple's aspect ratio, resizes to
+exact dimensions, and **repaints the headline**.
+
+That last part is the one worth understanding. Image models re-render text rather than preserving it, so
+the old pipeline shipped headlines with subtly wrong letterforms plus upscaling ringing — on the largest
+element of the screenshot. Measured on a real run: the enhanced headline came back visibly soft with halo
+artifacts, and the model had quietly redrawn the letterforms. Now the model does the artwork and Pillow
+owns the type, via `headline.py` — the same code that drew the scaffold. Typography is pixel-identical
+across the whole set as a side effect.
+
+The band behind the headline is repainted by sampling the render's actual background colour per row from
+the left/right margins, not by filling the declared hex — the enhance pass drifts the background a few
+points and leaves a faint gradient, so a flat fill leaves a visible rectangle seam.
+
+**Files added by the fork**: `fonts.py`, `headline.py`, `finalize.py`.
+**Files modified**: `compose.py` (uses `headline.py`), `showcase.py` (uses `fonts.py`), `SKILL.md`.
+
+**Backend gotchas worth knowing** (both found by running it, not reading docs):
+
+- `pixeltamer edit` takes **exactly one** `-i` despite its `--help` saying the flag is repeatable.
+  Two or more references need `compose`.
+- `pixeltamer --size` is ignored on the codex backend for edits — output comes back at roughly the
+  input's aspect, ~850px wide, whatever you ask for. Harmless here: `finalize.py` upscales to Apple's
+  dimensions *and then* repaints the headline, so the upscale never touches the type.
+
+**Known corner case**: `fill_band` assumes the headline band contains only background. If a breakout
+element ever rises into it, the band will either paint over the element or stripe those rows with the
+nominal hex (via the sampling guard). The enhance prompts keep breakouts down at the device, so this
+hasn't come up — noted rather than engineered around.
