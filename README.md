@@ -1,141 +1,140 @@
 # ASO App Store Screenshots
 
-A Claude Code skill that generates high-converting App Store screenshots for your iOS app. It analyzes your codebase, identifies core benefits, and creates professional screenshot images using AI.
+A Claude Code skill that builds App Store screenshots for your iOS app. It reads your codebase to work out what the app is actually good at, pairs those benefits with your simulator screenshots, and hands back finished images at Apple's exact dimensions.
 
-## What It Does
+Forked from [adamlyttleapps/claude-skill-aso-appstore-screenshots](https://github.com/adamlyttleapps/claude-skill-aso-appstore-screenshots). The workflow and the prompt design are his and they're good. What changed here is the image backend, the font handling, and one opinionated change to how headline text gets rendered. Full list in [What's different](#whats-different-from-upstream).
 
-1. **Benefit Discovery** — Analyzes your app's codebase to identify the 3-5 core benefits that drive downloads
-2. **Screenshot Pairing** — Reviews your simulator screenshots, rates them, and pairs each with the best benefit
-3. **Generation** — Creates polished App Store screenshots using a two-stage process: deterministic scaffolding (compose.py) + AI enhancement (Nano Banana Pro via Gemini MCP)
-4. **Showcase** — Generates a preview image with all screenshots side-by-side
+## What it does
 
-## Installation
+1. **Benefit discovery** — reads your codebase and pulls out the 3-5 benefits that actually drive downloads
+2. **Screenshot pairing** — reviews your simulator screenshots, rates them, pairs each with the benefit it sells best
+3. **Generation** — three stages per screenshot: a deterministic scaffold, an AI enhance pass, then a finalize pass that crops, resizes, and repaints the headline
+4. **Showcase** — a side-by-side preview of the finished set
 
-### 1. Add the skill to Claude Code
+Progress is saved to Claude Code's memory between phases, so you can walk away mid-set and pick it up in a new conversation.
+
+## Install
+
+### 1. The skill
 
 ```bash
-claude install-skill github.com/adamlyttleapps/claude-skill-aso-appstore-screenshots
+npx skills add gabelul/claude-skill-aso-appstore-screenshots
 ```
 
-### 2. Install Python dependencies
+That installs into the current project. Add `-g` to install it globally instead.
+
+### 2. Pillow
 
 ```bash
 pip install Pillow
 ```
 
-### 3. Font requirement
+That's the only Python dependency. Everything else is stdlib.
 
-The skill uses **SF Pro Display Black** for headline text. On macOS, install it from [Apple's developer fonts](https://developer.apple.com/fonts/). The expected path is:
+### 3. An image backend
 
-```
-/Library/Fonts/SF-Pro-Display-Black.otf
-```
+The enhance stage needs an image model. Two work, and the skill checks for them in this order:
 
-### 4. Set up Gemini MCP (for AI enhancement)
-
-The generation phase requires [@houtini/gemini-mcp](https://www.npmjs.com/package/@houtini/gemini-mcp) to be configured as an MCP server in Claude Code:
+**pixeltamer, preferred.** Full disclosure, I wrote it, which is exactly why I'd rather tell you what it does than sell it:
 
 ```bash
-npm install -g @houtini/gemini-mcp
+npx skills add gabelul/pixeltamer-gpt-image-skill -g
+pixeltamer doctor
 ```
 
-Then add it to your Claude Code MCP config (`~/.claude/settings.json` or project `.mcp.json`).
+It drives gpt-image-2, and the reason it's the default here is the second backend: if you have a ChatGPT Plus subscription, it goes through the codex CLI and you never touch an API key. Log in with `codex login` and you're done. If you'd rather use an OpenAI key, it takes one of those too, and `doctor` will tell you which paths are live. Repo and full docs: [gabelul/pixeltamer-gpt-image-skill](https://github.com/gabelul/pixeltamer-gpt-image-skill).
+
+Two things about it that matter for this pipeline specifically, both of which cost me an afternoon to find out:
+
+- `edit` takes exactly one `-i`. Two or more references is `compose`. (Fixed in pixeltamer 0.5.6, where `--help` finally says so.)
+- `--size` only applies to `generate`. On the codex backend an edit comes back at the input's aspect ratio at roughly 850px on the short edge, whatever you asked for. `finalize.py` upscales from there, and since it repaints the headline afterwards, the upscale never touches your type. 0.5.6 warns you about this instead of letting you find out.
+
+**Gemini MCP, the alternative.** If you've already got an MCP exposing `generate_image` and `edit_image` for Nano Banana Pro, the skill will use it. Wire it into `~/.claude/settings.json` or a project `.mcp.json` and restart Claude Code.
+
+If neither is available the skill says so plainly and offers to build scaffolds only. Flat layouts, no photoreal device, but real files you can look at.
+
+### 4. Fonts, optional
+
+Headlines want **SF Pro Display Black**, from [Apple's developer fonts](https://developer.apple.com/fonts/). If you don't have it the skill uses the system variable font at `/System/Library/Fonts/SFNS.ttf` pinned to the same weight, which looks close enough that you'd need the two side by side to call it. Install Apple's pack later and it goes back to using that with no code change.
 
 ## Usage
 
-From within your app's project directory, run:
+From inside your app's project:
 
 ```
 /aso-appstore-screenshots
 ```
 
-The skill will guide you through each phase interactively. Progress is saved to Claude Code's memory system, so you can resume across conversations.
+It walks you through each phase and asks before it commits to anything expensive.
 
-## How It Works
+## How it works
 
-### Scaffold → Enhance Pipeline
+### Scaffold, enhance, finalize
 
-Rather than generating screenshots from scratch (which produces inconsistent results), the skill uses a two-stage approach:
+Generating a whole screenshot from a text prompt gives you a different layout every time, which is useless when the set has to look like a set. So the layout never goes near the model:
 
-1. **compose.py** creates a deterministic scaffold with exact text positioning, device frame, and your simulator screenshot composited inside
-2. **Nano Banana Pro** (via Gemini MCP) enhances the scaffold — adding a photorealistic device frame, breakout elements, and visual polish
+1. **`compose.py`** draws a scaffold: exact headline text at exact coordinates, device frame, your simulator screenshot composited into the screen. Pixel-perfect and completely deterministic.
+2. **The image backend** takes that scaffold and makes it look expensive. Photoreal device, depth, breakout panels, the polish a designer would add.
+3. **`finalize.py`** crops to Apple's aspect ratio, resizes to exact pixel dimensions, and repaints the headline.
 
-This ensures consistent layout across all screenshots while letting AI handle the creative enhancement.
+The first approved screenshot then becomes the style reference for every one after it, so the whole set comes out looking like it was made in one sitting.
 
-### Output
+### Why the headline gets repainted
 
-Screenshots are saved to a `screenshots/` directory in your project:
+This is the part I'd argue about if someone told me it was over-engineering.
+
+Image models don't preserve text. They *re-render* it. Send a headline through an enhance pass and it comes back with subtly different letterforms, and then you upscale that and it picks up ringing on every edge. On the largest, most conversion-critical element of the screenshot. I only caught it by cropping the output at 1:1 and putting it next to the scaffold, because at preview size it looks fine.
+
+So the model does the artwork and Pillow owns the type. `headline.py` is the single source of truth, used by the scaffold and again by the finalize pass, which means typography comes out pixel-identical across a whole set for free.
+
+Two details in there took measuring to get right, and both are the kind of thing that looks fine until it doesn't:
+
+**The band behind the headline is sampled, not filled.** The enhance pass drifts your background colour a few points and leaves a faint gradient behind even when the prompt tells it not to. Refilling with the hex you asked for leaves a visible rectangle. It now reads the actual colour per row from the left and right margins, which are always background because the headline is centred.
+
+**The band's bottom edge is found, not padded.** The model puts the device wherever it likes. Across three runs of one prompt I got y=698, 718 and 719. A fixed padding value quietly shaved the top bezel off the phone, and because the device never reaches the margins where the colour sampling happens, nothing caught it. `find_device_top` probes the centre for a drop in luminance instead: the device is dark, leftover headline text is white, so text can never be mistaken for the phone.
+
+## Output
 
 ```
 screenshots/
-  01-benefit-slug/          ← working versions
-    scaffold.png            ← deterministic compose.py output
-    v1.png, v2.png, v3.png  ← AI-enhanced versions
-    v1-resized.png, ...     ← cropped to App Store dimensions
-  final/                    ← approved screenshots, ready to upload
-    01-benefit-slug.png
-    02-benefit-slug.png
-  showcase.png              ← preview image with all screenshots
+  01-benefit-slug/
+    scaffold.png            ← compose.py, deterministic
+    v1.png v2.png v3.png    ← raw backend output, three to choose from
+    v1-resized.jpg …        ← finalize.py: cropped, resized, headline repainted
+  final/                    ← the approved one per benefit, ready to upload
+    01-benefit-slug.jpg
+  showcase.png
 ```
 
-The `final/` folder contains App Store-ready screenshots at exact Apple dimensions (default: 1290×2796px for iPhone 6.7").
+`final/` holds JPEGs at exact Apple dimensions, 1290×2796 by default for the 6.7" iPhone. JPEG on purpose: App Store Connect rejects PNGs carrying an alpha channel and image backends hand those back more often than you'd like.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `SKILL.md` | The skill prompt — defines the multi-phase workflow |
-| `compose.py` | Deterministic scaffold generator (Pillow-based) |
-| `generate_frame.py` | Generates the device frame template |
-| `showcase.py` | Generates the side-by-side showcase image |
-| `assets/device_frame.png` | Pre-rendered iPhone device frame template |
+| `SKILL.md` | The skill prompt, defines the multi-phase workflow |
+| `compose.py` | Deterministic scaffold generator |
+| `headline.py` | Headline typography, shared by the scaffold and finalize passes |
+| `finalize.py` | Crop to aspect, resize to exact dimensions, repaint the headline |
+| `fonts.py` | Font loading with the system-font fallback |
+| `showcase.py` | Side-by-side preview of the set |
+| `generate_frame.py` | Regenerates the device frame template |
+| `assets/device_frame.png` | Pre-rendered iPhone frame |
 
-## License
+## What's different from upstream
 
-MIT
+**Font fallback.** Upstream hardcodes `/Library/Fonts/SF-Pro-Display-{Black,Regular}.otf`. Those ship with Apple's downloadable font pack, not with macOS, so on a clean machine every run died at `OSError: cannot open resource` with nothing pointing at fonts as the cause. Sent back upstream as a standalone PR, since it's a plain bug fix that helps everyone.
 
----
+**Backend routing.** The enhance stage used to require a Gemini MCP. It now prefers pixeltamer and falls back to Gemini.
 
-## Local fork notes
+**`finalize.py` replaces the `sips` crop loop**, and repaints the headline while it's there. See above for why.
 
-This copy diverges from upstream. Re-pulling the repo will clobber these — merge, don't overwrite.
+If you re-pull from upstream, merge rather than overwrite. Files added: `fonts.py`, `headline.py`, `finalize.py`. Files changed: `compose.py`, `showcase.py`, `SKILL.md`.
 
-**1. Font fallback (`fonts.py`)** — upstream hardcodes `/Library/Fonts/SF-Pro-Display-{Black,Regular}.otf`,
-which only exist if you've downloaded Apple's font pack. On a stock Mac every run died with
-`OSError: cannot open resource`. `fonts.py` tries those first and falls back to the system variable font
-at `/System/Library/Fonts/SFNS.ttf`, pinned to the requested named weight. Install Apple's pack and it
-silently goes back to using it.
+### Known corner case
 
-**2. Backend-agnostic enhance stage** — the generation phase used to require a Gemini MCP. It now prefers
-[pixeltamer](https://github.com/gabelul/pixeltamer) (gpt-image-2 via OpenAI key or the codex CLI) and falls
-back to a Gemini MCP. See "Prerequisites Check" in `SKILL.md`.
+`fill_band` assumes the headline band is background and nothing else. If a breakout element ever climbs up into it, the band will either paint over that element or stripe those rows with the flat brand colour. The enhance prompts keep breakouts down around the device so it hasn't happened yet. Writing it down rather than building for it.
 
-**3. `finalize.py` replaces the `sips` crop loop** — it centre-crops to Apple's aspect ratio, resizes to
-exact dimensions, and **repaints the headline**.
+## Credit
 
-That last part is the one worth understanding. Image models re-render text rather than preserving it, so
-the old pipeline shipped headlines with subtly wrong letterforms plus upscaling ringing — on the largest
-element of the screenshot. Measured on a real run: the enhanced headline came back visibly soft with halo
-artifacts, and the model had quietly redrawn the letterforms. Now the model does the artwork and Pillow
-owns the type, via `headline.py` — the same code that drew the scaffold. Typography is pixel-identical
-across the whole set as a side effect.
-
-The band behind the headline is repainted by sampling the render's actual background colour per row from
-the left/right margins, not by filling the declared hex — the enhance pass drifts the background a few
-points and leaves a faint gradient, so a flat fill leaves a visible rectangle seam.
-
-**Files added by the fork**: `fonts.py`, `headline.py`, `finalize.py`.
-**Files modified**: `compose.py` (uses `headline.py`), `showcase.py` (uses `fonts.py`), `SKILL.md`.
-
-**Backend gotchas worth knowing** (both found by running it, not reading docs):
-
-- `pixeltamer edit` takes **exactly one** `-i` despite its `--help` saying the flag is repeatable.
-  Two or more references need `compose`.
-- `pixeltamer --size` is ignored on the codex backend for edits — output comes back at roughly the
-  input's aspect, ~850px wide, whatever you ask for. Harmless here: `finalize.py` upscales to Apple's
-  dimensions *and then* repaints the headline, so the upscale never touches the type.
-
-**Known corner case**: `fill_band` assumes the headline band contains only background. If a breakout
-element ever rises into it, the band will either paint over the element or stripe those rows with the
-nominal hex (via the sampling guard). The enhance prompts keep breakouts down at the device, so this
-hasn't come up — noted rather than engineered around.
+Original skill by [Adam Lyttle](https://github.com/adamlyttleapps). MIT, same as it was.
